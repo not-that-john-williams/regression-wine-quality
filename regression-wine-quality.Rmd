@@ -1,0 +1,605 @@
+---
+title: "Training Linear Regression Models Using `caret`"
+author: "John Williams"
+date: "12/20/2021"
+output: 
+  github_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+In this vignette, we explore the process for creating predictive linear regression models. Our goal is to predict wine quality using one of these models.
+
+To streamline our work, we use the `caret` package in R to train our models. `caret` provides tools for:
+
+  * partitioning data
+  * pre-processing data
+  * selecting training methods 
+  * model tuning using resampling
+  * estimating variable importance
+
+Most importantly, `caret` provides a uniform interface for model training and prediction. We can chose from over 230 different modeling functions in R without needing to learn the unique syntax for each one. To learn more about `caret`, click [here](https://topepo.github.io/caret/index.html).
+
+## Resources
+
+### Packages
+
+We use the following R packages in this vignette:
+
+  * `tidyverse` - Set of packages that work in harmony as they share common data representations and API design.
+  * `corrplot` - Provides a visual exploratory tool on correlation matrix that supports automatic variable reordering to help detect hidden patterns among variables.
+  * `caret` - Various functions for training and plotting classification and regression models.
+  * `leaps` - Provides an efficient function for subset selection in linear regression, including exhaustive search.
+  * `pls` - Implements Principal Component Regression (PCR) and Partial Least Squares Regression (PLSR)
+  * `elasticnet` - Provides functions for fitting penalized regression models
+
+```{r packages, include = FALSE}
+library(tidyverse)  # Set of packages that work in harmony as they share common
+                    # data representations and API design.
+library(corrplot)  # Provides a visual exploratory tool on correlation matrix
+                   # that supports automatic variable reordering to help detect
+                   # hidden patterns among variables.
+library(caret)  # Various functions for training and plotting classification and
+                # regression models.
+library(leaps)  # Provides an efficient function for subset selection in linear
+                # regression, including exhaustive search.
+library(pls)  # Implements Principal Component Regression (PCR) and Partial
+              # Least Squares Regression (PLSR)
+library(elasticnet)  # Provides functions for fitting penalized regression
+                     # models
+```
+
+### Reproducibility
+
+For reproducibility...
+
+```{r reproducibility}
+set.seed(2021)
+seeds <- vector(mode = "list", length = 100)
+for(i in 1:100) seeds[[i]] <- sample.int(1000, 100)
+```
+
+### Helper Functions
+
+These helper functions are used within this vignette. They are not generic; they are specific for models trained in this vignette.
+
+  * `predictorNames` - Returns a character vector of the names of predictors used within a specific backward or forward elimination model.
+  * `createFormula` - Given a vector of predictor names, returns a formula that can be used within the function `lm`.
+
+```{r functions}
+# Function that returns a character vector of the names of predictors used
+# within a specific backward or forward elimination model. This function is not
+# generic; it is specific for models trained in this vignette.
+predictorNames <- function(fit, nvmax){
+  fit.summary <- summary(fit)
+  vec <- fit.summary$which[nvmax, ]
+  df <- t(as.data.frame(vec))
+  fit.nvmax <- df[ , names(vec)[vec]]
+  names <- names(fit.nvmax)[-1]
+  names.corrected <- str_replace_all(names, "typewhite", "type")
+  return(names.corrected)
+}
+
+# Given a vector of predictor names, this function returns a formula that can be
+# used within the function `lm`. This function is not generic; it is specific
+# for models trained in this vignette.
+createFormula <- function(charVec){
+  formula <- as.formula(paste0("quality ~ ", paste(charVec, collapse = " + ")))
+  return(formula)
+}
+```
+
+### Data
+
+To train our models, we use the [Wine Quality Data Set](https://archive.ics.uci.edu/ml/datasets/wine+quality) from the UC Irvine Machine Learning Repository. It includes two datasets which are related to red and white variants of the Portuguese "Vinho Verde" wine. Both datasets include intrinsic physical and chemical characteristics of the wine. They do not include identifiable features such as grape type, wine brand, and wine selling price. For simplicity, we merge the two datasets, creating a categorical variable for wine type:
+
+```{r data}
+red <- read.csv2("data/winequality-red.csv") %>%
+       mutate_if(is.character, as.numeric) %>%  # Convert all character
+                                                # variables to numeric
+       mutate(type = "red")
+
+white <- read.csv2("data/winequality-white.csv") %>%
+         mutate_if(is.character, as.numeric) %>%
+         mutate(type = "white")
+
+wine <- bind_rows(red, white) %>%
+        mutate(type = as.factor(type)) %>%
+        rename(free.SO2 = free.sulfur.dioxide,
+               total.SO2 = total.sulfur.dioxide)
+```
+
+Now that we have our wine quality data in a tidy format, let's take a closer look at the variables. There are 13 wine attributes presented in the dataset `wine`:
+
+  * `fixed.acidity`
+  * `volatile.acidity`
+  * `citric.acid`
+  * `residual.sugar`
+  * `chlorides`
+  * `free.SO2`
+  * `total.SO2`
+  * `density`
+  * `pH`
+  * `sulphates`
+  * `alcohol`
+  * `type`
+  * `quality`
+  
+The first 11 are numeric variables. The twelfth, `type`, is a factor, either "red" or "white" wine. The last attribute, `quality`, is the response; it is based on sensory data and scored from 0 to 10.
+
+## Preliminary Steps
+
+### Checking for Problems with the Predictors
+
+Before we begin the process of developing a regression model to predict wine quality, we should determine if there are any problems with our predictor variables. Should the effect of measurement errors be considered in the model? Do the predictor variables need scaling?  Are some predictors linear combinations of other predictors?
+
+For the first question, we will ignore possible errors in measurement as we do not have information on how the physical and chemical characteristics of wines were obtained. For scaling, the `caret` package will conveniently convert all the predictors to standard units (mean 0 and variance 1). So we just need to focus on the last question: is there colinearity among predictors. 
+
+Colinearity occurs when two or more predictor variables are highly correlated. If our predictors are not independent of each other, we could face problems when we fit a model and interpret the results. Using the `corrplot` package, we can view the correlation among predictors as a graph:
+
+```{r correlation}
+# Compute correlation matrix
+corMatrix <- round(cor(wine[ , 1:11]), 2)
+
+# Display correlation matrix as a graph
+corrplot::corrplot(corMatrix,
+                   method = "color",  # Visualization method
+                   diag = FALSE,      # Do not include the diagonal
+                   type = "upper",    # Only display upper triangular matrix
+                   order = "hclust",  # Display variables in hierarchical
+                                      # clustering order
+                   tl.col = "black",  # Set color of text for row/column labels
+                   tl.srt = 45,       # Rotate column names by 45 degrees
+                   addCoef.col = "black",  # Add the correlation coefficients
+                   title = "Correlation of Predictors",
+                   mar = c(0,0,1,0))  # Set graph margins
+```
+
+`alcohol` and `density` have a pairwise correlation of -0.69; `free.sulfur.dioxide` and `total.sulfur.dioxide` have a pairwise correlation of 0.72. It's possible that these predictors are not independent within pairs. We should be mindful of this as we begin to train models.
+
+### Partitioning the Data
+
+Creating a training set and test set is an important first step in building a regression model.  As the names imply, the training set is used to fit (or train) our models; the test set is used to see how well the final model performs on "new" data. The `caret` package provides a useful function, `createDataPartition`, to partition data into two independent sets that follow the same probability distributions.  Here we create a training set that is 70% of the original data (with the test set having the remaining 30%):
+
+```{r partitioning}
+# Create data partition index
+trainIndex <- createDataPartition(wine$quality,
+                times = 1,     # The number of partitions to create
+                p = 0.70,      # The percentage of data that goes to training
+                list = FALSE)  # Results should be in a matrix, not list
+
+# Create training set
+wineTrain <- wine[ trainIndex, ]
+
+# Create test set
+wineTest  <- wine[-trainIndex, ]
+```
+
+### Resampling
+
+We use the generic `train` function in the `caret` package to fit our linear regression models. This function can evaluate, using resampling, the effect of model tuning parameters on performance. For our models, we use 10-fold cross validation as the resampling method. We create a global object `lmControl` that specifies the resampling method in the appropriate syntax `train` needs:
+
+```{r resampling}
+# Set the resampling method for training all models
+lmControl <- trainControl(method = "cv",  # Cross validation
+                          number = 10,    # 10-Fold
+                          seeds = seeds)  # For reproducibility
+```
+
+If we wish to change the resampling method used for training our models, we can simply adjust this object.
+
+For a review of cross validation, click [here]().
+
+### Comparing Models
+
+To compare the performance of one model to another, we will use two metrics: RMSE and adjusted R-squared. Root Mean Square Error (RMSE) is the standard deviation of the residuals (prediction errors). A model with a lower RMSE generally implies a better fit. Adjusted R-squared measures the proportion of variation in the response explained by the linear regression model after adjusting for the number of predictors. A model with a higher adjusted R-squared implies a better fit with parsimony.
+
+## Model Training
+
+### First-Order Multiple Linear Regression
+
+For our first prediction model, let's fit a first-order multiple linear regression with all predictors (without interactions or higher order terms). This model is represented as
+
+$$Y = \beta_0 + \beta_1 X_1 + \beta_2 X_2 + ... + \beta_n X_n + \epsilon$$
+
+where $Y$ is the dependent variable (response), $X_i$ are the independent variables (predictors), and $\epsilon$ is the random error term.
+
+```{r firstFit}
+set.seed(2021)  # For reproducibility
+
+firstFit <- train(quality ~ ., 
+                  data = wineTrain,
+                  method = "lm",
+                  preProcess = c("center", "scale"),
+                  trControl = lmControl)
+
+# Display summary of the fitted model
+firstFit.summary <- summary(firstFit)
+firstFit.summary
+
+# Save results of fitted model in a named vector
+firstFit.results <- c("RMSE" = firstFit.summary$sigma, 
+                      "adjR^2" = firstFit.summary$adj.r.squared)
+```
+
+For model comparison later, we note that the RMSE for `firstFit` is `r firstFit.summary$sigma` and its adjusted R-squared is `r firstFit.summary$adj.r.squared`.
+
+Let's examine the variable importance in the model `firstFit`. Variable importance is the relative influence of each variable in the model; or, in other words, how much the model "uses" each variable to make accurate predictions. The more a model relies on a variable to make predictions, the more important it is for the model. `caret` provides a useful function, `varImp`, to calculate variable importance for models produced by `train`.
+
+```{r firstFit.importance}
+# Calculate variable importance
+varImp <- varImp(firstFit)
+
+# Reformat output from varImp() so it can be used by ggplot()
+importance <- as_tibble(varImp$importance, rownames = "variable") %>%
+              arrange(desc(Overall))
+
+# Output a graph of the variable importance
+ggplot(importance,
+         aes(x = reorder(variable, Overall), 
+             y = Overall, fill = Overall)) +
+         geom_col() +
+         coord_flip() +
+         theme(legend.position = "none") +
+         labs(x = "Predictors",  
+              y = "Importance %", 
+              title = "Variable Importance",
+              subtitle = "First-Order Multiple Linear Regression Model")
+```
+
+We see `volatile.acidity` and `alcohol` contribute the most to predicting wine quality; `chlorides` and `citric.acid` contribute the least. `chlorides` is also the only variable that is not statistically significant (at level $\alpha = 0.05$) in this model.
+
+### Second-Order Multiple Linear Regression
+
+In this section, we introduce second-order terms as predictors to see if we can create a better model. We do not yet consider interaction terms. This model is represented as
+
+$$Y = \beta_0 + \beta_1 X_1 + ... + \beta_n X_n + \beta_{n+1} X_1^2 + ... + 
+\beta_{2n} X_n^2 + \epsilon$$
+
+where $Y$ is the dependent variable (response), $X_i$ are the independent variables (predictors), and $\epsilon$ is the random error term.
+
+
+```{r secondFit}
+set.seed(2021)  # For reproducibility
+
+secondFit <- train(quality ~ . + I(fixed.acidity^2) + I(volatile.acidity^2) +
+                     I(citric.acid^2) + I(residual.sugar^2) + I(chlorides^2) +
+                     I(free.SO2^2) + I(total.SO2^2) + I(density^2) + I(pH^2) +
+                     I(sulphates^2) + I(alcohol^2),
+                   data = wineTrain,
+                   method = "lm",
+                   preProcess = c("center", "scale"),
+                   trControl = lmControl)
+
+# Display summary of the fitted model
+secondFit.summary <- summary(secondFit)
+secondFit.summary
+
+# Save results of fitted model in a named vector
+secondFit.results <- c("RMSE" = secondFit.summary$sigma, 
+                       "adjR^2" = secondFit.summary$adj.r.squared)
+```
+
+We remember for model comparison later that the RMSE for `secondFit` is `r secondFit.summary$sigma` and its adjusted R-squared is `r secondFit.summary$adj.r.squared`.
+
+How does variable importance look for the `secondFit` model:
+
+```{r secondFit.importance}
+# Calculate variable importance
+varImp <- varImp(secondFit)
+
+# Reformat output from varImp() so it can be used by ggplot()
+importance <- as_tibble(varImp$importance, rownames = "variable") %>%
+              arrange(desc(Overall))
+
+# Output a graph of the variable importance
+ggplot(importance,
+         aes(x = reorder(variable, Overall), 
+             y = Overall, fill = Overall)) +
+         geom_col() +
+         coord_flip() +
+         theme(legend.position = "none") +
+         labs(x = "Predictors",  
+              y = "Importance %", 
+              title = "Variable Importance",
+              subtitle = "Second-Order Multiple Linear Regression Model")
+```
+
+Comparing the importance of variables in models `firstFit` and `secondFit`, we find some similarities and some differences:
+
+  * `volatile.acidity` remains relatively important in both models.
+  * `chlorides` remains unimportant in both models, and its companion second-order term `chlorides^2` is also statistically insignificant in the `secondFit` model.
+  * While the first-order predictor `alcohol` is very important in the `firstFit` model, it is negligibly important in the `secondFit` model.
+  * In the `secondFit` model, `alcohol^2` is a more important predictor than its lower-order partner `alcohol`.
+
+### Second-Order Multiple Linear Regression with Interaction
+
+Now, we turn our attention to a second-order multiple linear regression that includes all first-order pairs of interaction terms. If we only had 2 predictors, we could represent this model as
+
+$$Y = \beta_0 + \beta_1 X_1 + \beta_2 X_2 + \beta_3 X_1X_2 + \beta_4 X_1^2 + 
+\beta_5 X_2^2 + \epsilon$$
+
+where $Y$ is the dependent variable (response), $X_i$ are the independent variables (predictors), and $\epsilon$ is the random error term.
+
+```{r polyFit}
+set.seed(2021)  # For reproducibility
+
+polyFit <- train(quality ~ . * . + I(fixed.acidity^2) +I(volatile.acidity^2) +
+                   I(citric.acid^2) + I(residual.sugar^2) + I(chlorides^2) +
+                   I(free.SO2^2) + I(total.SO2^2) + I(density^2) + I(pH^2) +
+                   I(sulphates^2) + I(alcohol^2),
+                 data = wineTrain,
+                 method = "lm",
+                 preProcess = c("center", "scale"),
+                 trControl = lmControl)
+
+# Create summary of the fitted model
+polyFit.summary <- summary(polyFit)
+
+# Save results of fitted model in a named vector
+polyFit.results <- c("RMSE" = polyFit.summary$sigma, 
+                     "adjR^2" = polyFit.summary$adj.r.squared)
+```
+
+Since the model `polyFit` has `r length(predictors(polyFit))` predictors, the model summary output would be quite long and we chose not to print it here. We can summarize the `polyFit` model by acknowledging its RMSE, `r polyFit.summary$sigma`, and its adjusted R-squared, `r polyFit.summary$adj.r.squared`. We can also summarize the variable importance for this model:
+
+```{r polyFit.importance}
+# Calculate variable importance
+varImp <- varImp(polyFit)
+
+# Reformat output from varImp() so it can be used by ggplot()
+importance <- as_tibble(varImp$importance, rownames = "variable") %>%
+              arrange(desc(Overall))
+
+last <- length(predictors(polyFit))
+
+# Output a graph of the variable importance (top 10 and bottom 10 only)
+ggplot(importance[c(1:10, (last-9):last), ],
+         aes(x = reorder(variable, Overall), 
+             y = Overall, fill = Overall)) +
+         geom_col() +
+         coord_flip() +
+         theme(legend.position = "none") +
+         labs(x = "Predictors",  
+              y = "Importance %", 
+              title ="Variable Importance of `polyFit` Model",
+              subtitle = "Top 10 and Bottom 10 Only")
+```
+
+Comparing the RMSE and adjusted R-squared of the three models we'd trained so far, we find the `polyFit` model, which includes interaction and second-order terms, is likely a better predicting model than one that excludes these terms.
+
+## Model Shrinkage
+
+The model `polyFit` has a large number of predictors, `r length(predictors(polyFit))` in total, and more than half are not statistically significant. Ideally, we want a "good fitting" model that is not so complex. We prefer a parsimonious model, one that predicts accurately with the fewest amount of predictors possible. In other words, our goal is to shrink the number of predictors and still have a model with a relatively low RMSE and high adjusted R-squared. The `caret` package offers a wide-range of linear regression methods to shrink our models. In this section, we will consider training models using backward elimination, forward elimination, and lasso regression.
+
+### Backward Elimination
+
+Our first shrinkage methods is backward elimination.
+
+```{r backwardFit}
+set.seed(2021)  # For reproducibility
+
+# Train a linear regression model using backward elimination
+backwardFit <- train(quality ~ . * . + I(fixed.acidity^2) +
+                       I(volatile.acidity^2) + I(citric.acid^2) +
+                       I(residual.sugar^2) + I(chlorides^2) + I(free.SO2^2) +
+                       I(total.SO2^2) + I(density^2) + I(pH^2) +
+                       I(sulphates^2) + I(alcohol^2),
+                     data = wineTrain,
+                     method = "leapBackward",
+                     tuneGrid = data.frame(nvmax = 1:40),
+                     preProcess = c("center", "scale"),
+                     trControl = lmControl)
+
+# Plot of maximum number of predictors vs. RMSE
+plot(backwardFit)
+```
+
+From the plot, we see RMSE falls as more predictors are in the model. But eventually, the improvement we gain as we add predictors becomes marginal. Where we choose to shrink the model is truly arbitrary, but a reasonable choice here is at 16 predictors. We see no substantial reduction in RMSE by adding more than 16 predictors to the model.
+
+The 16 predictors in our chosen backward elimination model are
+
+```{r backwardFit.names, echo = FALSE, results = 'asis'}
+cat(paste('- `', predictorNames(backwardFit, 16), '`'), sep = '\n')
+```
+
+It is good practice to include lower order terms of any predictors used in higher order terms or interactions. Thus, we should include these "missing" lower order terms to the list of predictors above: `free.sulfur.dioxide`, `volatile.acidity`, `density`, `citric.acid`, `pH`, `total.sulfur.dioxide`, and `sulphates`. Using backward elimination, we have reduced the number of predictors to 23.
+
+Let's create the linear regression model using these predictors:
+
+```{r backwardFit.summary}
+backwardFit.names <- c(predictorNames(backwardFit, 16), "free.SO2",
+                       "volatile.acidity", "density", "citric.acid", "pH",
+                       "total.SO2", "sulphates")
+backwardFit.formula <- createFormula(backwardFit.names)
+backwardFit.model <- lm(backwardFit.formula, wineTrain)
+backwardFit.summary <- summary(backwardFit.model)
+backwardFit.summary
+```
+
+Although `free.sulfur.dioxide` is not statistically significant, we leave it in the model since its higher order term `I(free.sulfur.dioxide^2)` is.
+
+```{r backwardFit.results}
+# Save results of fitted model in a named vector
+backwardFit.results <- c("RMSE" = backwardFit.summary$sigma, 
+                         "adjR^2" = backwardFit.summary$adj.r.squared)
+```
+
+The final backward elimination model has RMSE of `r backwardFit.summary$sigma` and adjusted R-squared of `r backwardFit.summary$adj.r.squared`.
+
+### Forward Selection
+
+Another shrinkage method is forward elimination.
+
+```{r forwardFit}
+set.seed(2021)  # For reproducibility
+
+# Train a linear regression model using forward elimination
+forwardFit <- train(quality ~ . * . + I(fixed.acidity^2) +
+                      I(volatile.acidity^2) + I(citric.acid^2) +
+                      I(residual.sugar^2) + I(chlorides^2) + I(free.SO2^2) +
+                      I(total.SO2^2) + I(density^2) + I(pH^2) + I(sulphates^2) +
+                      I(alcohol^2),
+                    data = wineTrain,
+                    method = "leapForward",
+                    tuneGrid = data.frame(nvmax = 1:40),
+                    preProcess = c("center", "scale"),
+                    trControl = lmControl)
+
+# Plot of maximum number of predictors vs. RMSE
+plot(forwardFit)
+```
+
+In the plot of maximum number of predictors vs. RMSE, we see dips at 13, 21, and 30 predictors. We could choose to shrink the number of predictors to any of these values. Which we choose just depends on how much we want to shrink the model. For this example, we reduce the model to 21 predictors:
+
+```{r forwardFit.names, echo = FALSE, results = 'asis'}
+cat(paste('- `', predictorNames(forwardFit, 21), '`'), sep = '\n')
+```
+
+As we did in the backward elimination model, we should include any "missing" lower order predictors to the list above. We add `free.SO2`, `total.SO2`, `alcohol`, `fixed.acidity`, `pH`, `chlorides`, `sulphates`, and `type`. Using forward elimination, we have so far reduced the number of predictors to 29.
+
+Let's create the linear regression model using these predictors:
+
+```{r forwardFit.summary}
+forwardFit.names <- c(predictorNames(forwardFit, 21), "free.SO2", "total.SO2",
+                      "alcohol", "fixed.acidity", "pH", "chlorides",
+                      "sulphates", "type")
+forwardFit.formula <- createFormula(forwardFit.names)
+forwardFit.model <- lm(forwardFit.formula, wineTrain)
+forwardFit.summary <- summary(forwardFit.model)
+forwardFit.summary
+```
+
+We see that several interactions and a higher-order term are not significant after adding in the necessary first-order terms. We can leave the model as-is or we can choose to achieve a more parsimonious model by removing insignificant predictors one-by-one using backward elimination.
+
+This process (completed in the background) removes predictors ``r forwardFit.names[9]``, ``r forwardFit.names[10]``, ``r forwardFit.names[21]``, ``r forwardFit.names[8]``, and ``r forwardFit.names[19]``. Thus, the summary output for our final model trained using forward elimination is
+
+```{r forwardFit.model, echo = FALSE}
+forwardFit.names <- c(predictorNames(forwardFit, 21), "free.SO2", "total.SO2",
+                      "alcohol", "fixed.acidity", "pH", "chlorides",
+                      "sulphates", "type")
+forwardFit.names <- forwardFit.names[c(-9, -10, -21, -8, -19)]
+forwardFit.formula <- createFormula(forwardFit.names)
+forwardFit.model <- lm(forwardFit.formula, wineTrain)
+forwardFit.summary <- summary(forwardFit.model)
+forwardFit.summary
+```
+
+```{r forwardFit.results}
+# Save results of fitted model in a named vector
+forwardFit.results <- c("RMSE" = forwardFit.summary$sigma, 
+                        "adjR^2" = forwardFit.summary$adj.r.squared)
+```
+
+The final backward elimination model has RMSE of `r forwardFit.summary$sigma` and adjusted R-squared of `r forwardFit.summary$adj.r.squared`.
+
+### Lasso Regression
+
+```{r lassoFit}
+set.seed(2021)  # For reproducibility
+
+# Train a model using lasso regression
+lassoFit <- train(quality ~ . * . + I(fixed.acidity^2) + I(volatile.acidity^2) +
+                    I(citric.acid^2) + I(residual.sugar^2) + I(chlorides^2) +
+                    I(free.SO2^2) + I(total.SO2^2) + I(density^2) + I(pH^2) +
+                    I(sulphates^2) + I(alcohol^2),
+                  data = wineTrain,
+                  method = "lasso",
+                  tuneGrid = data.frame(fraction = seq(0, 0.1, 0.001)),
+                  preProcess = c("center", "scale"),
+                  trControl = lmControl)
+```
+
+The final model using lasso regression has 16 predictors:
+
+  - ` residual.sugar `
+  - ` I(volatile.acidity^2) `
+  - ` I(citric.acid^2) `
+  - ` I(free.SO2^2) `
+  - ` I(alcohol^2) `
+  - ` fixed.acidity:residual.sugar `
+  - ` volatile.acidity:total.SO2 `
+  - ` volatile.acidity:density `
+  - ` volatile.acidity:type `
+  - ` residual.sugar:alcohol `
+  - ` chlorides:total.SO2 `
+  - ` free.SO2:alcohol `
+  - ` free.SO2:type `
+  - ` total.SO2:sulphates `
+  - ` pH:alcohol `
+  - ` sulphates:alcohol `
+
+As a best practice, we should also include the lower order predictors `fixed.acidity`, `volatile.acidity`, `cirtic.acid`, `free.SO2`, `total.SO2`, `alcohol`, `density`, `pH`, `chlorides`, `sulphates`, and `type`. Thus, using lasso regression, we have so far reduced the total number of predictors from 89 to 27.
+
+Let's create the linear regression model using these predictors and get the summary:
+
+```{r lassoFit.summary}
+lassoFit.model <- lm(quality ~ . + I(volatile.acidity^2) + I(citric.acid^2) +
+                       I(free.SO2^2) + I(alcohol^2) +
+                       fixed.acidity:residual.sugar +
+                       volatile.acidity:total.SO2 + volatile.acidity:density +
+                       volatile.acidity:type + residual.sugar:alcohol +
+                       chlorides:total.SO2 + free.SO2:alcohol + free.SO2:type +
+                       total.SO2:sulphates + pH:alcohol + sulphates:alcohol,
+                     data = wineTrain)
+
+lassoFit.summary <- summary(lassoFit.model)
+lassoFit.summary
+```
+
+We could choose to leave our model as-is or shrink further by removing the interaction and higher-order terms that are insignificant (one-by-one using backward elimination). If we choose to do this reduction, we get the following model with 20 predictors:
+
+```{r lassoFit.model}
+lassoFit.model <- lm(quality ~ . + I(citric.acid^2) + I(free.SO2^2) +
+                       I(alcohol^2) + volatile.acidity:type + free.SO2:alcohol +
+                       free.SO2:type + total.SO2:sulphates + pH:alcohol,
+                     data = wineTrain)
+
+lassoFit.summary <- summary(lassoFit.model)
+lassoFit.summary
+```
+
+```{r lassoFit.results}
+# Save results of fitted model in a named vector
+lassoFit.results <- c("RMSE" = lassoFit.summary$sigma, 
+                      "adjR^2" = lassoFit.summary$adj.r.squared)
+```
+
+The final model trained using lasso regression has RMSE of `r lassoFit.summary$sigma` and adjusted R-squared of `r lassoFit.summary$adj.r.squared`.
+
+## Model Selection
+
+Let's create a table to compare the RMSE and adjusted R-Squared of the prediction models we have trained so far:
+
+```{r model.selection}
+fit.results <- bind_rows(firstFit.results,
+                         secondFit.results,
+                         polyFit.results,
+                         backwardFit.results,
+                         forwardFit.results,
+                         lassoFit.results)
+rownames(fit.results) <- c("firstFit",
+                           "secondFit",
+                           "polyFit",
+                           "backwardFit",
+                           "forwardFit",
+                           "lassoFit")
+
+knitr::kable(fit.results)
+```
+
+According to these results, the `polyFit` model is "best", but it is the most complex. The "best" parsimonious model is `forwardFit`. We choose this as our final prediction model and view its performance on the test data:
+
+```{r model.prediction}
+prediction <- predict(forwardFit, newdata = wineTest)
+postResample(prediction, wineTest$quality)
+```
+
+## Citations
+
+P. Cortez, A. Cerdeira, F. Almeida, T. Matos and J. Reis.
+Modeling wine preferences by data mining from physicochemical properties. In Decision Support Systems, Elsevier, 47(4):547-553, 2009.
